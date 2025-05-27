@@ -1,25 +1,23 @@
-import speech_recognition as sr
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, field_validator
+from typing import List, Optional
+import base64
+import os
+import uvicorn
+import requests
 import librosa
 import numpy as np
-import os
-from transformers import pipeline
-from pinecone import Pinecone, ServerlessSpec
-from openai import OpenAI
-# from elevenlabs import generate, stream
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
-from pydub import AudioSegment
-import uvicorn
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import base64
-from pydub import AudioSegment
-from pydub.utils import make_chunks
-import requests
 from pathlib import Path
 from datetime import datetime
+from pinecone import Pinecone
+from openai import OpenAI
+from pydub import AudioSegment
+import speech_recognition as sr
 from dotenv import load_dotenv
-from typing import List
+import json
 
 load_dotenv()
 
@@ -30,11 +28,51 @@ class ResponseModel(BaseModel):
     
 class AudioRequest(BaseModel):
     audioUrl: str  # Base64-encoded audio data
-    config: dict
-    savedFilePath: str
+    config: Optional[dict] = {}
+    savedFilePath: Optional[str] = ""
+    
+    @field_validator('audioUrl')
+    def validate_audio_url(cls, v):
+        if not v:
+            raise ValueError('audioUrl cannot be empty')
+        # Basic validation to ensure it looks like base64
+        try:
+            # Remove data URL prefix if present
+            if ',' in v:
+                v = v.split(',')[1]
+            # Test decode a small portion
+            base64.b64decode(v[:100])
+            return v
+        except Exception:
+            raise ValueError('Invalid base64 audio data')
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Add custom exception handler for validation errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print(f"Validation error: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Invalid request format. Please check your audio data encoding.",
+            "errors": str(exc)
+        }
+    )
+
+# Add custom exception handler for general exceptions
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    print(f"General error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc)
+        }
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Change this to your frontend URL in production
@@ -45,7 +83,7 @@ app.add_middleware(
 
 # Path to save uploaded audio
 AUDIO_FILE_PATH = "temp_audio.wav"
-AUDIO_SAVE_DIR = "audio_files"  # Directory to save original audio files
+AUDIO_SAVE_DIR = "audio_files"
 
 # Create the directory if it doesn't exist
 os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
@@ -53,50 +91,35 @@ os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
 # Load API keys
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-# elevenlabs_api_key = (os.getenv("ELEVENLABS_API_KEY"))
-google_speech_to_text_api_key = os.getenv("GOOGLE_SPEECH_TO_TEXT_API_KEY")
 
 # Define Pinecone index name
 INDEX_NAME = "asd-therapy-interactions"
-
 index = pc.Index(INDEX_NAME)
-
-# Path to save audio for analysis
-AUDIO_FILE_PATH = "temp_audio.wav"
 
 def extract_features(audio_path, sr=22050):
     """
     Extract audio features using librosa.
     Returns a feature vector with MFCCs and other audio characteristics.
     """
-    # Load audio file
-    y, sr = librosa.load(audio_path, sr=sr)
-    
-    # Extract features
-    mfccs = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).T, axis=0)
-    chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
-    mel = np.mean(librosa.feature.melspectrogram(y=y, sr=sr).T, axis=0)
+    try:
+        # Load audio file
+        y, sr = librosa.load(audio_path, sr=sr)
+        
+        # Extract features
+        mfccs = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).T, axis=0)
+        chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
+        mel = np.mean(librosa.feature.melspectrogram(y=y, sr=sr).T, axis=0)
 
-    # Combine features into a single array
-    features = np.hstack([mfccs, chroma, mel])
-    return features
-
-import os
-import base64
-import requests
-from pathlib import Path
-from datetime import datetime
+        # Combine features into a single array
+        features = np.hstack([mfccs, chroma, mel])
+        return features
+    except Exception as e:
+        print(f"Error extracting features: {e}")
+        return None
 
 def speech_to_text(audio_url, config):
     """
     Convert speech to text using Google Cloud Speech-to-Text API.
-
-    Args:
-        audio_url (str): Base64-encoded audio data.
-        config (dict): Configuration for the audio (e.g., encoding, sample rate, language code).
-
-    Returns:
-        str: Transcribed text from the audio.
     """
     try:
         # Create uploads directory if it doesn't exist
@@ -113,6 +136,10 @@ def speech_to_text(audio_url, config):
         file_path = audio_dir / file_name
 
         # Convert base64 string to binary and save to file
+        # Handle data URL format (data:audio/wav;base64,...)
+        if ',' in audio_url:
+            audio_url = audio_url.split(',')[1]
+            
         audio_data = base64.b64decode(audio_url)
         with open(file_path, 'wb') as audio_file:
             audio_file.write(audio_data)
@@ -150,148 +177,185 @@ def speech_to_text(audio_url, config):
         print(f"Error converting speech to text: {err}")
         return f"Error: {str(err)}"
 
-    except Exception as err:
-        print(f"Error converting speech to text: {err}")
-        return {"error": str(err)}
-
 # Function to generate OpenAI embeddings
 def generate_embedding(text: str) -> list:
-    return client.embeddings.create(input=[text], model="text-embedding-ada-002").data[0].embedding
+    try:
+        return client.embeddings.create(input=[text], model="text-embedding-ada-002").data[0].embedding
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return []
 
 def similarity_search(query_embedding: list, top_k: int = 5):
-    results = index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
-    return results["matches"]
+    try:
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k,
+            include_metadata=True
+        )
+        return results["matches"]
+    except Exception as e:
+        print(f"Error in similarity search: {e}")
+        return []
 
 # Function to combine all data for OpenAI query
 def formulate_openai_query(text: str, context: list):
-    # Format context from Pinecone results
-    context_str = "\n".join([
-        f"Child: {match['metadata']['text']}"  # Assuming metadata contains the question text
-        for match in context if match['metadata']['role'] == 'child'
-    ])
-    
-    response_str = "\n".join([
-        f"Assistant: {match['metadata']['text']}"  # Assuming metadata contains the response text
-        for match in context if match['metadata']['role'] == 'assistant'
-    ])
-    
-    # Formulate query for OpenAI
-    query = (
-        f"The child said: \"{text}\".\n\n"
-        f"Relevant past interactions:\n{context_str}\n\n"
-        f"Assistant responses:\n{response_str}\n\n"
-        f"Provide a response that is supportive and suitable for a child with ASD."
-    )
-    print("Generated OpenAI Query:")
-    print(query)
-    
-    return query
+    try:
+        # Format context from Pinecone results
+        context_str = "\n".join([
+            f"Child: {match['metadata']['text']}"
+            for match in context if match.get('metadata', {}).get('role') == 'child'
+        ])
+        
+        response_str = "\n".join([
+            f"Assistant: {match['metadata']['text']}"
+            for match in context if match.get('metadata', {}).get('role') == 'assistant'
+        ])
+        
+        # Formulate query for OpenAI
+        query = (
+            f"The child said: \"{text}\".\n\n"
+            f"Relevant past interactions:\n{context_str}\n\n"
+            f"Assistant responses:\n{response_str}\n\n"
+            f"Provide a response that is supportive and suitable for a child with ASD."
+        )
+        print("Generated OpenAI Query:")
+        print(query)
+        
+        return query
+    except Exception as e:
+        print(f"Error formulating OpenAI query: {e}")
+        return f"The child said: \"{text}\". Provide a supportive response for a child with ASD."
 
 # Function to get response from OpenAI using chat models
 def get_response_from_openai(prompt: str):
-    # Modify the system instruction to include generating follow-up questions
-    system_instruction = (
-        "You are a voice assistant for a child with autistic spectrum disorders. "
-    "Your purpose is to help the child understand emotions and improve social interaction skills. "
-    "When responding, always include one or two simple follow-up questions that the child could ask to continue the conversation. "
-    "Make sure the questions are phrased in the first person (e.g., 'Whom should I talk to?') and are easy to understand and relevant to the context. "
-    "Format your response as follows:\n\n"
-    "Response: <Your main response>\n"
-    "Follow-up Questions: <Question 1>|<Question 2>"
-    )
-
-    response = client.chat.completions.create(
-        model="ft:gpt-3.5-turbo-0125:personal:spectrum-learner:AarQpVNF",  # Chat model
-        messages=[
-            {"role": "system", "content": system_instruction},  # Updated system instructions
-            {"role": "user", "content": prompt}  # User input
-        ],
-        max_tokens=200,
-        temperature=0.7
-    )
-
-    # Extract the response text
-    response_text = response.choices[0].message.content.strip()
-
-    # Split the response into main response and follow-up questions
-    if "Follow-up Questions:" in response_text:
-        main_response, follow_up_questions = response_text.split("Follow-up Questions:")
-        main_response = main_response.replace("Response:", "").strip()
-        follow_up_questions = follow_up_questions.strip().split("|")
-    else:
-        main_response = response_text
-        follow_up_questions = []
-
-    return {
-        "main_response": main_response,
-        "follow_up_questions": follow_up_questions
-    }
-# def detect_emotion(audio_path):
-#     """
-#     Detect emotion from an audio file using a pre-trained Hugging Face model.
-#     """
-#     try:
-#         # Use the pipeline to classify the audio file
-#         print(f"Analyzing emotions in: {audio_path}")
-#         results = pipe(audio_path)
-        
-#         # Extract the top result (highest confidence emotion)
-#         emotion = results[0]['label']
-#         confidence = results[0]['score']
-        
-#         print(f"Detected Emotion: {emotion} (Confidence: {confidence:.2f})")
-#         return emotion
-#     except Exception as e:
-#         print(f"Error in emotion detection: {e}")
-#         return "Unknown"
-
-# def generate_audio(text: str):
-#         """Generate audio response using ElevenLabs."""
-#         audio_stream = generate(
-#             api_key=elevenlabs_api_key,
-#             text=text,
-#             voice="Brian",
-#             stream=True
-#         )
-#         stream(audio_stream)
-
-# Endpoint to process audio file
-@app.post("/process-audio", response_model=ResponseModel)
-async def process_audio(request: AudioRequest):
     try:
-        # Decode base64 audio data (assume raw base64 without prefix)
-        audio_data = base64.b64decode(request.audioUrl)
+        system_instruction = (
+            "You are a voice assistant for a child with autistic spectrum disorders. "
+            "Your purpose is to help the child understand emotions and improve social interaction skills. "
+            "When responding, always include one or two simple follow-up questions that the child could ask to continue the conversation. "
+            "Make sure the questions are phrased in the first person (e.g., 'Whom should I talk to?') and are easy to understand and relevant to the context. "
+            "Format your response as follows:\n\n"
+            "Response: <Your main response>\n"
+            "Follow-up Questions: <Question 1>|<Question 2>"
+        )
+
+        response = client.chat.completions.create(
+            model="ft:gpt-3.5-turbo-0125:personal:spectrum-learner:AarQpVNF",
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
+
+        # Extract the response text
+        response_text = response.choices[0].message.content.strip()
+
+        # Split the response into main response and follow-up questions
+        if "Follow-up Questions:" in response_text:
+            main_response, follow_up_questions = response_text.split("Follow-up Questions:")
+            main_response = main_response.replace("Response:", "").strip()
+            follow_up_questions = [q.strip() for q in follow_up_questions.strip().split("|") if q.strip()]
+        else:
+            main_response = response_text
+            follow_up_questions = []
+
+        return {
+            "main_response": main_response,
+            "follow_up_questions": follow_up_questions
+        }
+    except Exception as e:
+        print(f"Error getting OpenAI response: {e}")
+        return {
+            "main_response": "I'm sorry, I'm having trouble processing your request right now.",
+            "follow_up_questions": ["Can you try asking me something else?"]
+        }
+
+# Alternative endpoint that handles raw request body
+@app.post("/process-audio-raw")
+async def process_audio_raw(request: Request):
+    try:
+        # Get raw body
+        body = await request.body()
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(body.decode('utf-8'))
+        except UnicodeDecodeError:
+            # If body contains binary data, handle differently
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Invalid request format. Please send JSON data."}
+            )
+        
+        # Extract audio URL from the parsed data
+        audio_url = data.get('audioUrl', '')
+        config = data.get('config', {})
+        
+        if not audio_url:
+            raise HTTPException(status_code=400, detail="audioUrl is required")
+        
+        # Process the audio
+        return await process_audio_logic(audio_url, config)
+        
+    except Exception as e:
+        print(f"Error in process_audio_raw: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Error processing audio: {str(e)}"}
+        )
+
+async def process_audio_logic(audio_url: str, config: dict):
+    """Common logic for processing audio"""
+    temp_file_path = None
+    try:
+        # Handle data URL format
+        if ',' in audio_url:
+            audio_url = audio_url.split(',')[1]
+            
+        # Decode base64 audio data
+        audio_data = base64.b64decode(audio_url)
+
+        # Create unique temporary file path
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        temp_file_path = f"temp_audio_{timestamp}.wav"
 
         # Save the audio file
-        with open(AUDIO_FILE_PATH, "wb") as f:
+        with open(temp_file_path, "wb") as f:
             f.write(audio_data)
-        print(f"Audio file saved to: {AUDIO_FILE_PATH}")
+        print(f"Audio file saved to: {temp_file_path}")
 
-        # Convert audio to WAV format using pydub (if necessary)
-        audio = AudioSegment.from_file(AUDIO_FILE_PATH)
-        audio.export(AUDIO_FILE_PATH, format="wav")
-        print("Audio file converted to WAV format")
+        # Convert audio to WAV format using pydub
+        try:
+            audio = AudioSegment.from_file(temp_file_path)
+            audio.export(temp_file_path, format="wav")
+            print("Audio file converted to WAV format")
+        except Exception as e:
+            print(f"Warning: Could not convert audio format: {e}")
 
-        # Convert speech to text
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(AUDIO_FILE_PATH) as source:
-            audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data)
-            print(f"Recognized Text: {text}")
-        
-        # text = speech_to_text(request.audioUrl, request.config)
-        # print(f"Speech-to-Text Result: {text}")
+        # Convert speech to text using speech_recognition
+        text = ""
+        try:
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(temp_file_path) as source:
+                audio_data_sr = recognizer.record(source)
+                text = recognizer.recognize_google(audio_data_sr)
+                print(f"Recognized Text: {text}")
+        except Exception as e:
+            print(f"Error in speech recognition: {e}")
+            # Fallback to Google Cloud Speech API if available
+            if os.getenv("GOOGLE_SPEECH_TO_TEXT_API_KEY"):
+                text = speech_to_text(audio_url, config)
+            else:
+                text = "Could not transcribe audio"
             
         # Generate embedding and perform similarity search
         query_embedding = generate_embedding(text)
-        similar_interactions = similarity_search(query_embedding)
+        similar_interactions = similarity_search(query_embedding) if query_embedding else []
 
         # Formulate OpenAI query
-        prompt = formulate_openai_query(text,similar_interactions)
+        prompt = formulate_openai_query(text, similar_interactions)
 
         # Get OpenAI response
         openai_response = get_response_from_openai(prompt)
@@ -305,14 +369,29 @@ async def process_audio(request: AudioRequest):
     except Exception as e:
         print(f"Error in processing audio: {e}")
         return ResponseModel(
-            main_response=f"Error: {str(e)}",
-            follow_up_questions=[]
+            main_response=f"I'm sorry, I encountered an error while processing your audio. Please try again.",
+            follow_up_questions=["Can you repeat what you said?"]
         )
 
     finally:
         # Clean up temporary audio file
-        if os.path.exists(AUDIO_FILE_PATH):
-            os.remove(AUDIO_FILE_PATH)
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                print(f"Cleaned up temporary file: {temp_file_path}")
+            except Exception as e:
+                print(f"Error cleaning up file: {e}")
+
+# Main endpoint to process audio file
+@app.post("/process-audio", response_model=ResponseModel)
+async def process_audio(request: AudioRequest):
+    return await process_audio_logic(request.audioUrl, request.config)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "message": "Voice assistant is running"}
+
 # Run the app
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

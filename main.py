@@ -46,6 +46,15 @@ class AudioRequest(BaseModel):
         except Exception:
             raise ValueError('Invalid base64 audio data')
 
+class TextRequest(BaseModel):
+    text: str
+    
+    @field_validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError('text cannot be empty')
+        return v.strip()
+
 # Initialize FastAPI app
 app = FastAPI()
 
@@ -386,6 +395,31 @@ async def process_audio_logic(audio_url: str, config: dict):
 @app.post("/process-audio", response_model=ResponseModel)
 async def process_audio(request: AudioRequest):
     return await process_audio_logic(request.audioUrl, request.config)
+
+@app.post("/process-text", response_model=ResponseModel)
+async def process_text(request: TextRequest):
+    try:
+        # Generate embedding and perform similarity search
+        query_embedding = generate_embedding(request.text)
+        similar_interactions = similarity_search(query_embedding) if query_embedding else []
+
+        # Formulate OpenAI query
+        prompt = formulate_openai_query(request.text, similar_interactions)
+
+        # Get OpenAI response
+        openai_response = get_response_from_openai(prompt)
+
+        # Return response
+        return ResponseModel(
+            main_response=openai_response["main_response"],
+            follow_up_questions=openai_response["follow_up_questions"]
+        )
+    except Exception as e:
+        print(f"Error in processing text: {e}")
+        return ResponseModel(
+            main_response=f"I'm sorry, I encountered an error while processing your text. Please try again.",
+            follow_up_questions=["Can you try asking me something else?"]
+        )
 
 # Health check endpoint
 @app.get("/health")

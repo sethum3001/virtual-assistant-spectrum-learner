@@ -240,12 +240,12 @@ def get_response_from_openai(prompt: str):
     try:
         system_instruction = (
             "You are a voice assistant for a child with autistic spectrum disorders. "
-            "Your purpose is to help the child understand emotions and improve social interaction skills. "
-            "When responding, always include one or two simple follow-up questions that the child could ask to continue the conversation. "
-            "Make sure the questions are phrased in the first person (e.g., 'Whom should I talk to?') and are easy to understand and relevant to the context. "
+            "Your goal is to help the child understand emotions, express their feelings, and improve social interaction skills in a gentle, easy-to-understand way."
+            "Use calm, reassuring language. Avoid complex words or abstract phrases. "
+            "You may include one simple follow-up question within your response. (e.g., 'Can I help you figure out what made you feel this way?').  "
             "Format your response as follows:\n\n"
             "Response: <Your main response>\n"
-            "Follow-up Questions: <Question 1>|<Question 2>"
+            "Follow-up Questions: <Question 1>"
         )
 
         response = client.chat.completions.create(
@@ -359,20 +359,42 @@ async def process_audio_logic(audio_url: str, config: dict):
             else:
                 text = "Could not transcribe audio"
             
-        # Generate embedding and perform similarity search
-        query_embedding = generate_embedding(text)
-        similar_interactions = similarity_search(query_embedding) if query_embedding else []
+        # Get OpenAI response directly using the transcribed text
+        system_instruction = (
+            "You are a voice assistant for a child with autistic spectrum disorders. "
+            "Your goal is to help the child understand emotions, express their feelings, and improve social interaction skills in a gentle, easy-to-understand way."
+            "Use calm, reassuring language. Avoid complex words or abstract phrases. "
+            "You may include one simple follow-up question within your response. (e.g., 'Can I help you figure out what made you feel this way?').  "
+            "Format your response as follows:\n\n"
+            "Response: <Your main response>\n"
+            "Follow-up Questions: <Question 1>"
+        )
 
-        # Formulate OpenAI query
-        prompt = formulate_openai_query(text, similar_interactions)
+        response = client.chat.completions.create(
+            model="ft:gpt-3.5-turbo-0125:personal:spectrum-learner:AarQpVNF",
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"The child said: \"{text}\". Provide a supportive response."}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
 
-        # Get OpenAI response
-        openai_response = get_response_from_openai(prompt)
+        # Extract the response text
+        response_text = response.choices[0].message.content.strip()
 
-        # Return response
+        # Split the response into main response and follow-up questions
+        if "Follow-up Questions:" in response_text:
+            main_response, follow_up_questions = response_text.split("Follow-up Questions:")
+            main_response = main_response.replace("Response:", "").strip()
+            follow_up_questions = [q.strip() for q in follow_up_questions.strip().split("|") if q.strip()]
+        else:
+            main_response = response_text
+            follow_up_questions = []
+
         return ResponseModel(
-            main_response=openai_response["main_response"],
-            follow_up_questions=openai_response["follow_up_questions"]
+            main_response=main_response,
+            follow_up_questions=follow_up_questions
         )
 
     except Exception as e:
@@ -399,20 +421,42 @@ async def process_audio(request: AudioRequest):
 @app.post("/process-text", response_model=ResponseModel)
 async def process_text(request: TextRequest):
     try:
-        # Generate embedding and perform similarity search
-        query_embedding = generate_embedding(request.text)
-        similar_interactions = similarity_search(query_embedding) if query_embedding else []
+        # Get OpenAI response directly using the input text
+        system_instruction = (
+            "You are a voice assistant for a child with autistic spectrum disorders. "
+            "Your goal is to help the child understand emotions, express their feelings, and improve social interaction skills in a gentle, easy-to-understand way."
+            "Use calm, reassuring language. Avoid complex words or abstract phrases. "
+            "If appropriate, you may include one simple follow-up prompt within your response, written naturally as part of the conversation. (e.g., 'Can I help you figure out what made you feel this way?').  "
+            "Format your response as follows:\n\n"
+            "Response: <Your main response>\n"
+            "Follow-up Questions: <Question 1>"
+        )
 
-        # Formulate OpenAI query
-        prompt = formulate_openai_query(request.text, similar_interactions)
+        response = client.chat.completions.create(
+            model="ft:gpt-3.5-turbo-0125:personal:spectrum-learner:AarQpVNF",
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"The child said: \"{request.text}\". Provide a supportive response."}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
 
-        # Get OpenAI response
-        openai_response = get_response_from_openai(prompt)
+        # Extract the response text
+        response_text = response.choices[0].message.content.strip()
 
-        # Return response
+        # Split the response into main response and follow-up questions
+        if "Follow-up Questions:" in response_text:
+            main_response, follow_up_questions = response_text.split("Follow-up Questions:")
+            main_response = main_response.replace("Response:", "").strip()
+            follow_up_questions = [q.strip() for q in follow_up_questions.strip().split("|") if q.strip()]
+        else:
+            main_response = response_text
+            follow_up_questions = []
+
         return ResponseModel(
-            main_response=openai_response["main_response"],
-            follow_up_questions=openai_response["follow_up_questions"]
+            main_response=main_response,
+            follow_up_questions=follow_up_questions
         )
     except Exception as e:
         print(f"Error in processing text: {e}")
